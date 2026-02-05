@@ -1,5 +1,5 @@
 from typing import List
-from utils import size
+from llmcompass_utils import size
 
 
 class DataType:

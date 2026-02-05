@@ -1,4 +1,4 @@
-from utils import size
+from llmcompass_utils import size
 from typing import List, Tuple
 from hardware_model.device import Device
 from software_model.operators import Operator

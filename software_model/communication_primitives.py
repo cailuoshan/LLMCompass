@@ -7,7 +7,7 @@ from hardware_model.interconnect import (
 )
 from software_model.utils import Tensor, DataType
 from typing import Any, List
-from utils import size
+from llmcompass_utils import size
 from math import ceil
 
 
