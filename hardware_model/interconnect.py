@@ -28,6 +28,14 @@ class LinkModule:
 link_module_dict = {
     "NVLinkV3": LinkModule(25e9, 50e9, 8.92e-6, 16, 256, 16),
     "TPUv3Link": LinkModule(81.25e9 / 2, 81.25e9, 150e-6, 16, 256, 16),
+    "XSNoC": LinkModule(
+        bandwidth_per_direction=128e9,   # 64 B/cycle @ 2GHz = 128GB/s
+        bandwidth_both_direction=256e9,  # 全双工
+        latency=12e-9,                   # ~3 cycle per hop, ~8 hops per req = 24 cycles = 12 ns
+        flit_size=32,
+        max_payload_size=64,
+        header_size=16
+    ),
 }
 # we cannot find a way to measure TPU p2p latency, we also don't know TPU packet format
 
@@ -58,6 +66,12 @@ interconnect_module_dict = {
     ),
     "TPUv3Link_8": InterConnectModule(
         4, TopologyType.RING, link_module_dict["TPUv3Link"], 2, 162.5e9
+    ),
+    # 8 核 CPU 片上 NoC，拓扑先当作 FC（每核都可以和任意核高带宽通信），TODO: 后续可以换成 RING 或者自己扩展一个 MESH 类型
+    "XSNoC_8": InterConnectModule(
+        8, TopologyType.FC, link_module_dict["XSNoC"], 
+        link_count_per_device=1,  # 一核视为一条“总出口带宽”的逻辑 link
+        internal_link_bandwidth_per_direction=512e9,  # L2/LLC → NoC → mem 的等效路径带宽
     ),
 }
 

@@ -1,0 +1,72 @@
+{
+    "name": "XSAI with DSA (V1)",
+    "device_count": 1,
+    "interconnect": {
+        "link": {
+            "name": "XSNoC",
+            "bandwidth_per_direction_byte": 128e9,
+            "bandwidth_both_directions_byte": 256e9,
+            "latency_second": 12e-9,
+            "flit_size_byte": 32,
+            "header_size_byte": 16,
+            "max_payload_size_byte": 64
+        },
+        "link_count_per_device": 1,
+        "topology": "FC"
+    },
+    "device": {
+        "frequency_Hz": 2e9,
+        "compute_chiplet_count": 1,
+        "compute_chiplet": {
+            "physical_core_count": 8,
+            "core_count": 8,
+            "process_node": "7nm",
+            "core": {
+                "sublane_count": 1,
+                "systolic_array": {
+                    "array_width": 64,
+                    "array_height": 64,
+                    "data_type": "fp16",
+                    "mac_per_cycle": 16
+                },
+                "vector_unit": {
+                    "vector_width": 8,
+                    "flop_per_cycle": 8,
+                    "data_type": "fp16",
+                    "int32_count": 16,
+                    "fp16_count": 0,
+                    "fp32_count": 16,
+                    "fp64_count": 8
+                },
+                "register_file": {
+                    "num_reg_files": 1,
+                    "num_registers": 4096,
+                    "register_bitwidth":64,
+                    "num_rdwr_ports":4
+                },
+                "SRAM_KB": 2048
+            }
+        },
+        "memory_protocol": "DDR5",
+        "_memory_protocol_list": [
+            "HBM2e",
+            "DDR4",
+            "DDR5",
+            "PCIe4",
+            "PCIe5"
+        ],
+        "io": {
+            "process_node": "7nm",
+            "global_buffer_MB": 16,
+            "physical_global_buffer_MB": 16,
+            "global_buffer_bandwidth_per_cycle_byte": 512,
+            "memory_channel_physical_count": 4,
+            "memory_channel_active_count": 4,
+            "pin_count_per_channel": 16,
+            "bandwidth_per_pin_bit": 6.4e9
+        },
+        "memory": {
+            "total_capacity_GB": 32
+        }
+    }
+}
