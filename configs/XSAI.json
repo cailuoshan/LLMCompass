@@ -27,11 +27,11 @@
                     "array_width": 64,
                     "array_height": 64,
                     "data_type": "fp16",
-                    "mac_per_cycle": 16
+                    "mac_per_cycle": 1
                 },
                 "vector_unit": {
                     "vector_width": 8,
-                    "flop_per_cycle": 8,
+                    "flop_per_cycle": 2,
                     "data_type": "fp16",
                     "int32_count": 16,
                     "fp16_count": 0,
