@@ -57,6 +57,19 @@ class TransformerBlockInitComputationTP(Operator):
         self.layer_norm1 = LayerNorm(data_type)
         self.allreduce_ffn = AllReduceMultiPCB(data_type)
 
+    def set_recording_names(self):
+        for name in (
+            "Q_proj",
+            "Q_mul_K",
+            "A_mul_V",
+            "H_matmul0",
+            "H_matmul1",
+            "H_matmul2",
+            "A_softmax",
+            "layer_norm0",
+        ):
+            getattr(self, name).recording_name = name
+
     def __call__(self, X: Tensor) -> Tensor:
         # b: batch size
         # s: sequence length
@@ -393,6 +406,19 @@ class TransformerBlockAutoRegressionTP(Operator):
         self.H_matmul2 = Matmul(data_type)
         self.layer_norm1 = LayerNorm(data_type)
         self.allreduce_ffn = AllReduceMultiPCB(data_type)
+
+    def set_recording_names(self):
+        for name in (
+            "Q_proj",
+            "Q_mul_K",
+            "A_mul_V",
+            "H_matmul0",
+            "H_matmul1",
+            "H_matmul2",
+            "A_softmax",
+            "layer_norm0",
+        ):
+            getattr(self, name).recording_name = name
 
     def __call__(self, x: Tensor, seq_len: int) -> Tensor:
         # b: batch size

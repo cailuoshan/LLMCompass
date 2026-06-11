@@ -1,6 +1,7 @@
 from llmcompass_utils import size
 from typing import List, Tuple
 from hardware_model.device import Device
+from software_model.design_point_recorder import get_active_recorder
 from software_model.operators import Operator
 from software_model.utils import Tensor, DataType
 from math import ceil, log2, log
@@ -115,12 +116,25 @@ class LayerNorm(Operator):
             l1_tile_N,
         )
         cycle_count = self.simulate(self.computational_graph, mapping, pcb_module)
+        recorder = get_active_recorder()
+        if recorder is not None and self.recording_name is not None:
+            recorder.record_operator_mapping_trial(
+                operator_name=self.recording_name,
+                operator_type="LayerNorm",
+                execution_kind="tiled_mapping",
+                graph={"M": M, "N": N},
+                mapping=mapping,
+                cycle_count=cycle_count,
+                raw_local_latency_s=cycle_count
+                / pcb_module.compute_module.clock_freq,
+            )
         if cycle_count < min_cycle_count:
             min_cycle_count = cycle_count
             best_mapping = mapping
         self.best_mapping = best_mapping
         self.best_cycle_count = min_cycle_count
         self.best_latency = min_cycle_count / pcb_module.compute_module.clock_freq
+        self.execution_kind = "tiled_mapping"
         self.latency = self.best_latency
         # self.best_mapping.display()
         return self.latency

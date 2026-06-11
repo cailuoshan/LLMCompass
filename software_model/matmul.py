@@ -2,6 +2,10 @@ from llmcompass_utils import size
 from typing import List, Tuple
 from hardware_model.device import Device
 from software_model.operators import Operator
+from software_model.design_point_recorder import (
+    get_active_recorder,
+    trial_latency_scope,
+)
 from software_model.utils import Tensor, DataType
 from math import ceil, log2, floor
 import torch
@@ -55,24 +59,46 @@ class BatchedMatmul(Operator):
     #     return self.latency
 
     def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
-        matmul = Matmul(self.data_type)
-        _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
-        matmul_latency1 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
-        )
+        per_batch_matmul = Matmul(self.data_type)
+        per_batch_matmul.recording_name = self.recording_name
+        _ = per_batch_matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
+        with trial_latency_scope("per_batch_matmul", multiplier=self.bs):
+            matmul_latency1_raw = per_batch_matmul.compile_and_simulate(
+                pcb_module, compile_mode
+            )
+        matmul_latency1 = matmul_latency1_raw * self.bs
 
-        matmul = Matmul(self.data_type)
-        _ = matmul(
+        fused_k_matmul = Matmul(self.data_type)
+        fused_k_matmul.recording_name = self.recording_name
+        _ = fused_k_matmul(
             Tensor([self.M, self.K * self.bs]), Tensor([self.K * self.bs, self.N])
         )
-        matmul_latency2 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode)
-            + (self.bs - 1)
+        fused_extra_io_latency_s = (
+            (self.bs - 1)
             * self.M
             * self.N
             * self.data_type.word_size
             / pcb_module.io_module.bandwidth
         )
+        with trial_latency_scope(
+            "fused_k_matmul", additive_s=fused_extra_io_latency_s
+        ):
+            matmul_latency2_raw = fused_k_matmul.compile_and_simulate(
+                pcb_module, compile_mode
+            )
+        matmul_latency2 = matmul_latency2_raw + fused_extra_io_latency_s
+
+        if matmul_latency1 <= matmul_latency2:
+            selected_matmul = per_batch_matmul
+            self.selected_strategy = "per_batch_matmul"
+            self.best_latency = matmul_latency1
+        else:
+            selected_matmul = fused_k_matmul
+            self.selected_strategy = "fused_k_matmul"
+            self.best_latency = matmul_latency2
+        self.best_mapping = selected_matmul.best_mapping
+        self.best_cycle_count = selected_matmul.best_cycle_count
+        self.execution_kind = selected_matmul.execution_kind
         self.latency = min(matmul_latency1, matmul_latency2)
         return self.latency
 
@@ -299,6 +325,17 @@ class Matmul(Operator):
             self.latency = max(
                 compute_latency, io_latency
             )  # + pcb_module.io_module.latency * 2
+            self.best_mapping = None
+            self.best_cycle_count = None
+            self.best_latency = self.latency
+            self.execution_kind = "vector_fast_path"
+            self._record_trial(
+                pcb_module,
+                mapping=None,
+                cycle_count=None,
+                raw_local_latency_s=self.latency,
+                execution_kind=self.execution_kind,
+            )
             return self.latency
         if compile_mode == "exhaustive":
             for l2_tile_M_log2 in range(5, ceil(log2(self.computational_graph.M)) + 1):
@@ -387,6 +424,9 @@ class Matmul(Operator):
                                                     self.computational_graph,
                                                     mapping,
                                                     pcb_module,
+                                                )
+                                                self._record_trial(
+                                                    pcb_module, mapping, cycle_count
                                                 )
                                                 if cycle_count < min_cycle_count:
                                                     min_cycle_count = cycle_count
@@ -495,6 +535,7 @@ class Matmul(Operator):
                                 mapping,
                                 pcb_module,
                             )
+                            self._record_trial(pcb_module, mapping, cycle_count)
                             # end = time.time()
                             # if i % 1000 == 0:
                             #     print(f"{i} simulation time: {end-start}")
@@ -585,6 +626,7 @@ class Matmul(Operator):
                                         mapping,
                                         pcb_module,
                                     )
+                                    self._record_trial(pcb_module, mapping, cycle_count)
                                     end = time.time()
                                     # if i % 1000 == 0:
                                     #     print(f"{i} simulation time: {end-start}")
@@ -655,6 +697,7 @@ class Matmul(Operator):
                             mapping,
                             pcb_module,
                         )
+                        self._record_trial(pcb_module, mapping, cycle_count)
                         # end=time.time()
                         # print(f'simulation time: {end-start}')
                         if cycle_count < min_cycle_count:
@@ -723,6 +766,7 @@ class Matmul(Operator):
                             mapping,
                             pcb_module,
                         )
+                        self._record_trial(pcb_module, mapping, cycle_count)
                         # end=time.time()
                         # print(f'simulation time: {end-start}')
                         if cycle_count < min_cycle_count:
@@ -735,9 +779,39 @@ class Matmul(Operator):
         #     self.best_mapping.display()
         self.best_cycle_count = min_cycle_count
         self.best_latency = min_cycle_count / pcb_module.compute_module.clock_freq
+        self.execution_kind = "tiled_mapping"
         self.latency = self.best_latency
         # self.best_mapping.display()
         return self.latency
+
+    def _record_trial(
+        self,
+        pcb_module: Device,
+        mapping,
+        cycle_count,
+        raw_local_latency_s=None,
+        execution_kind="tiled_mapping",
+    ):
+        recorder = get_active_recorder()
+        if recorder is None or self.recording_name is None:
+            return
+        if raw_local_latency_s is None:
+            raw_local_latency_s = (
+                cycle_count / pcb_module.compute_module.clock_freq
+            )
+        recorder.record_operator_mapping_trial(
+            operator_name=self.recording_name,
+            operator_type="Matmul",
+            execution_kind=execution_kind,
+            graph={
+                "M": self.computational_graph.M,
+                "N": self.computational_graph.N,
+                "K": self.computational_graph.K,
+            },
+            mapping=mapping,
+            cycle_count=cycle_count,
+            raw_local_latency_s=raw_local_latency_s,
+        )
 
     def simulate(
         self,

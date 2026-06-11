@@ -25,6 +25,7 @@ class Operator:
         self.verbose = verbose
         self.log = ""
         self.comment = ""
+        self.recording_name = None
         # simulation results
         self.latency = 0
         self.latency_on_gpu = 1
