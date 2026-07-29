@@ -311,6 +311,7 @@ class Matmul(Operator):
         if (M == 1 or N == 1) and (
             compile_mode == "heuristic-GPU"
             or compile_mode == "heuristic-our-throughput"
+            or compile_mode == "exhaustive"
         ):
             working_set_size = M * K + N * K + M * N
             total_io_count = working_set_size * self.data_type.word_size
