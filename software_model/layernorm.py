@@ -109,6 +109,10 @@ class LayerNorm(Operator):
                 2 * l1_tile_N * data_type.word_size
             )
             l1_tile_M = min(l1_tile_M, M)
+        elif compile_mode == "exhaustive":
+            raise NotImplementedError("Exhaustive search is not implemented yet.")
+        else:
+            raise ValueError(f"Unknown compile mode: {compile_mode}")
         mapping = self.Mapping(
             l2_tile_M,
             l2_tile_N,
