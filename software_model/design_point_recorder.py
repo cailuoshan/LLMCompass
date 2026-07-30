@@ -499,6 +499,11 @@ def get_active_recorder() -> Optional[DesignPointRecorder]:
     return _ACTIVE_RECORDER.get()
 
 
+def get_trial_latency_modifiers() -> Dict[str, Any]:
+    """Return the effective strategy/multiplier for an emitted trial."""
+    return dict(_TRIAL_LATENCY.get())
+
+
 @contextmanager
 def trial_latency_scope(
     strategy: Optional[str] = None,

@@ -4,6 +4,7 @@ from hardware_model.device import Device
 from software_model.operators import Operator
 from software_model.design_point_recorder import (
     get_active_recorder,
+    get_trial_latency_modifiers,
     trial_latency_scope,
 )
 from software_model.utils import Tensor, DataType
@@ -16,6 +17,12 @@ import pandas as pd
 import os
 from scalesim.scale_sim import scalesim
 import copy
+from software_model.search_protocol import (
+    MappingCandidate,
+    ProviderProtocolError,
+    deduplicate_candidates,
+    validate_ranked_ids,
+)
 
 
 class BatchedMatmul(Operator):
@@ -58,13 +65,16 @@ class BatchedMatmul(Operator):
     #     self.latency = matmul_latency * self.bs  # + pcb_module.io_module.latency * 2
     #     return self.latency
 
-    def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
+    def compile_and_simulate(self, pcb_module: Device, compile_mode: str, **kwargs):
+        if compile_mode == "transfer-learn":
+            return self._compile_and_simulate_transfer_learn(pcb_module, **kwargs)
+        self._active_trial_sink = kwargs.get("trial_sink")
         per_batch_matmul = Matmul(self.data_type)
         per_batch_matmul.recording_name = self.recording_name
         _ = per_batch_matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
         with trial_latency_scope("per_batch_matmul", multiplier=self.bs):
             matmul_latency1_raw = per_batch_matmul.compile_and_simulate(
-                pcb_module, compile_mode
+                pcb_module, compile_mode, trial_sink=kwargs.get("trial_sink")
             )
         matmul_latency1 = matmul_latency1_raw * self.bs
 
@@ -84,7 +94,7 @@ class BatchedMatmul(Operator):
             "fused_k_matmul", additive_s=fused_extra_io_latency_s
         ):
             matmul_latency2_raw = fused_k_matmul.compile_and_simulate(
-                pcb_module, compile_mode
+                pcb_module, compile_mode, trial_sink=kwargs.get("trial_sink")
             )
         matmul_latency2 = matmul_latency2_raw + fused_extra_io_latency_s
 
@@ -100,6 +110,51 @@ class BatchedMatmul(Operator):
         self.best_cycle_count = selected_matmul.best_cycle_count
         self.execution_kind = selected_matmul.execution_kind
         self.latency = min(matmul_latency1, matmul_latency2)
+        return self.latency
+
+    def _compile_and_simulate_transfer_learn(self, pcb_module, provider=None, stage=None, hardware=None, trial_sink=None, operator_name=None):
+        if provider is None:
+            raise ProviderProtocolError("transfer-learn requires a provider")
+        candidates = []
+        for strategy, k in (("per_batch_matmul", self.K), ("fused_k_matmul", self.K * self.bs)):
+            base = Matmul(self.data_type)
+            base.recording_name = self.recording_name
+            base(Tensor([self.M, k]), Tensor([k, self.N]))
+            candidates.extend(base.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"), strategy=strategy))
+        records = [candidate.to_dict() for candidate in candidates]
+        top_k = getattr(provider, "top_k", "all")
+        selected_ids = provider.rank(operator_name or self.recording_name or "BatchedMatmul", stage, hardware or {}, {}, records, top_k)
+        selected_ids = validate_ranked_ids(records, selected_ids, top_k)
+        by_id = {candidate.candidate_id: candidate for candidate in candidates}
+        best = None
+        for candidate_id in selected_ids:
+            candidate = by_id[candidate_id]
+            base = Matmul(self.data_type)
+            base.recording_name = self.recording_name
+            try:
+                if candidate.strategy == "per_batch_matmul":
+                    base(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
+                    with trial_latency_scope(candidate.strategy, multiplier=self.bs):
+                        raw = base.evaluate_transfer_candidate(pcb_module, candidate, trial_sink=trial_sink)
+                    latency = raw * self.bs
+                else:
+                    base(Tensor([self.M, self.K * self.bs]), Tensor([self.K * self.bs, self.N]))
+                    extra = (self.bs - 1) * self.M * self.N * self.data_type.word_size / pcb_module.io_module.bandwidth
+                    with trial_latency_scope(candidate.strategy, additive_s=extra):
+                        raw = base.evaluate_transfer_candidate(pcb_module, candidate, trial_sink=trial_sink)
+                    latency = raw + extra
+            except Exception as exc:
+                raise RuntimeError("transfer candidate evaluation failed: stage={}, operator={}, candidate_id={}".format(stage, operator_name or self.recording_name, candidate_id)) from exc
+            if best is None or latency < best[0]:
+                best = (latency, candidate, base)
+        if best is None:
+            raise ProviderProtocolError("provider selected no batched matmul candidates")
+        self.best_latency, selected, base = best
+        self.selected_strategy = selected.strategy
+        self.best_mapping = base.best_mapping
+        self.best_cycle_count = base.best_cycle_count
+        self.execution_kind = base.execution_kind
+        self.latency = self.best_latency
         return self.latency
 
     def run_on_gpu(
@@ -302,7 +357,18 @@ class Matmul(Operator):
         self,
         pcb_module: Device,
         compile_mode: str = "exhaustive",
+        provider=None,
+        stage=None,
+        hardware=None,
+        trial_sink=None,
+        operator_name=None,
     ):
+        if compile_mode == "transfer-learn":
+            return self._compile_and_simulate_transfer_learn(
+                pcb_module, provider=provider, stage=stage, hardware=hardware,
+                trial_sink=trial_sink, operator_name=operator_name
+            )
+        self._active_trial_sink = trial_sink
         min_cycle_count = 2**63 - 1
         best_mapping = None
         M = self.computational_graph.M
@@ -785,6 +851,127 @@ class Matmul(Operator):
         # self.best_mapping.display()
         return self.latency
 
+    def _make_transfer_candidate(self, mapping, strategy=None, execution_kind="tiled_mapping"):
+        name = self.recording_name or "Matmul"
+        graph = {"M": self.computational_graph.M, "N": self.computational_graph.N, "K": self.computational_graph.K}
+        return MappingCandidate(
+            operator_name=name,
+            operator_type="Matmul",
+            execution_kind=execution_kind,
+            strategy=strategy,
+            graph=graph,
+            mapping={key: value for key, value in vars(mapping).items()} if mapping is not None else {},
+            mapping_object=mapping,
+        )
+
+    def enumerate_transfer_candidates(self, pcb_module: Device, generation_mode="heuristic-GPU", strategy=None):
+        """Enumerate mapping records without invoking the cycle simulator."""
+        if generation_mode not in ("heuristic-GPU", "exhaustive"):
+            raise ValueError("transfer candidate generation supports heuristic-GPU or exhaustive")
+        M, N, K = self.computational_graph.M, self.computational_graph.N, self.computational_graph.K
+        if (M == 1 or N == 1) and generation_mode in ("heuristic-GPU", "exhaustive"):
+            return [self._make_transfer_candidate(None, strategy, "vector_fast_path")]
+        if generation_mode == "exhaustive":
+            result = []
+            for m_log2 in range(5, ceil(log2(M)) + 1):
+                for n_log2 in range(5, ceil(log2(N)) + 1):
+                    for k_log2 in range(5, ceil(log2(K)) + 1):
+                        l2_m, l2_n, l2_k = 2 ** m_log2, 2 ** n_log2, 2 ** k_log2
+                        capacity = pcb_module.compute_module.l2_size // self.data_type.word_size
+                        working = l2_n * l2_k + l2_m * l2_k + l2_m * l2_n
+                        if working > capacity:
+                            continue
+                        l2_double = working <= capacity // 2
+                        for lm_log2 in range(5, m_log2 + 1):
+                            for ln_log2 in range(5, n_log2 + 1):
+                                for lk_log2 in range(5, k_log2 + 1):
+                                    l1_m, l1_n, l1_k = 2 ** lm_log2, 2 ** ln_log2, 2 ** lk_log2
+                                    if l1_m * l1_n + l1_n * l1_k + l1_m * l1_k > pcb_module.compute_module.core.SRAM_size // self.data_type.word_size // 2:
+                                        continue
+                                    for l2_order in ("mkn", "mnk", "nkm", "nmk", "knm", "kmn"):
+                                        for l1_order in ("mkn", "mnk", "nkm", "nmk", "knm", "kmn"):
+                                            for f_m, f_n, f_k in self.find_permutations(pcb_module.compute_module.core.systolic_array_count):
+                                                result.append(self._make_transfer_candidate(self.Mapping(l2_m, l2_n, l2_k, l2_double, l1_m, l1_n, l1_k, l2_order, l1_order, f_m, f_n, f_k), strategy))
+            result = deduplicate_candidates(result)
+            if not result:
+                raise ValueError("exhaustive transfer candidate enumeration returned no valid mappings")
+            return result
+        result = []
+        # This is the same heuristic-GPU candidate family used by the existing
+        # loop.  exhaustive is intentionally bounded to the same valid mapping
+        # protocol; its legacy full-search path is untouched.
+        for l2_tile_M in [64, 128, 256, 512, 1024, 2048]:
+            for l2_tile_N in [l2_tile_M // 2, l2_tile_M, l2_tile_M * 2]:
+                factors = [1, 2, 4, 8] if K <= 12288 else [max(1, K // x) for x in (1024, 2048, 4096, 8192)]
+                for factor in factors:
+                    l2_tile_K = 2 ** floor(log2(max(1, ceil(K / factor))))
+                    working = l2_tile_N * l2_tile_K + l2_tile_M * l2_tile_K + l2_tile_M * l2_tile_N
+                    capacity = pcb_module.compute_module.l2_size // self.data_type.word_size
+                    if working > capacity:
+                        continue
+                    is_l2_double_buffering = working <= capacity // 2
+                    for l1_tile_M in [32, 64, 128, 256]:
+                        if l1_tile_M > min(l2_tile_M, l2_tile_N):
+                            continue
+                        l1_tile_N = l1_tile_M
+                        for l1_factor in [1, 2, 4, 8, 16, 32]:
+                            l1_tile_K = ceil(l2_tile_K / l1_factor)
+                            if l1_tile_M * l1_tile_N + l1_tile_N * l1_tile_K + l1_tile_M * l1_tile_K > pcb_module.compute_module.core.SRAM_size // self.data_type.word_size // 2:
+                                continue
+                            for l0_M, l0_N, l0_K in self.find_permutations(pcb_module.compute_module.core.systolic_array_count):
+                                mapping = self.Mapping(l2_tile_M, l2_tile_N, l2_tile_K, is_l2_double_buffering, l1_tile_M, l1_tile_N, l1_tile_K, "knm", "knm", l0_M, l0_N, l0_K)
+                                result.append(self._make_transfer_candidate(mapping, strategy))
+        result = deduplicate_candidates(result)
+        if not result:
+            raise ValueError("transfer candidate enumeration returned no valid matmul mappings")
+        return result
+
+    def evaluate_transfer_candidate(self, pcb_module: Device, candidate, trial_sink=None):
+        candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate(**candidate)
+        if candidate.execution_kind == "vector_fast_path":
+            M, N, K = self.computational_graph.M, self.computational_graph.N, self.computational_graph.K
+            working = (M * K + N * K + M * N) * self.data_type.word_size
+            io_latency = working / pcb_module.io_module.bandwidth
+            compute_latency = 2 * M * N * K / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle / pcb_module.compute_module.core_count / pcb_module.compute_module.clock_freq
+            latency = max(compute_latency, io_latency)
+            cycle_count = None
+        else:
+            mapping = candidate.mapping_object
+            if mapping is None:
+                raise ValueError("transfer candidate has no in-process mapping object")
+            cycle_count = self.simulate(self.computational_graph, mapping, pcb_module)
+            latency = cycle_count / pcb_module.compute_module.clock_freq
+        self._record_trial(pcb_module, candidate.mapping_object, cycle_count, latency, candidate.execution_kind, candidate.strategy, candidate, trial_sink)
+        self.best_mapping = candidate.mapping_object
+        self.best_cycle_count = cycle_count
+        self.best_latency = latency
+        self.execution_kind = candidate.execution_kind
+        self.latency = latency
+        return latency
+
+    def _compile_and_simulate_transfer_learn(self, pcb_module, provider=None, stage=None, hardware=None, trial_sink=None, operator_name=None):
+        if provider is None:
+            raise ProviderProtocolError("transfer-learn requires a provider")
+        candidates = self.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"))
+        records = [candidate.to_dict() for candidate in candidates]
+        top_k = getattr(provider, "top_k", "all")
+        selected_ids = provider.rank(operator_name or self.recording_name or "Matmul", stage, hardware or {}, {}, records, top_k)
+        selected_ids = validate_ranked_ids(records, selected_ids, top_k)
+        by_id = {candidate.candidate_id: candidate for candidate in candidates}
+        best = None
+        for candidate_id in selected_ids:
+            try:
+                latency = self.evaluate_transfer_candidate(pcb_module, by_id[candidate_id], trial_sink=trial_sink)
+            except Exception as exc:
+                raise RuntimeError("transfer candidate evaluation failed: stage={}, operator={}, candidate_id={}".format(stage, operator_name or self.recording_name, candidate_id)) from exc
+            if best is None or latency < best[0]:
+                best = (latency, by_id[candidate_id])
+        if best is None:
+            raise ProviderProtocolError("provider selected no candidates for {}".format(operator_name or self.recording_name))
+        self.best_latency, self.best_mapping = best[0], best[1].mapping_object
+        self.latency = self.best_latency
+        return self.latency
+
     def _record_trial(
         self,
         pcb_module: Device,
@@ -792,27 +979,32 @@ class Matmul(Operator):
         cycle_count,
         raw_local_latency_s=None,
         execution_kind="tiled_mapping",
+        strategy=None,
+        candidate=None,
+        trial_sink=None,
     ):
         recorder = get_active_recorder()
-        if recorder is None or self.recording_name is None:
-            return
         if raw_local_latency_s is None:
             raw_local_latency_s = (
                 cycle_count / pcb_module.compute_module.clock_freq
             )
-        recorder.record_operator_mapping_trial(
-            operator_name=self.recording_name,
-            operator_type="Matmul",
-            execution_kind=execution_kind,
-            graph={
-                "M": self.computational_graph.M,
-                "N": self.computational_graph.N,
-                "K": self.computational_graph.K,
-            },
-            mapping=mapping,
-            cycle_count=cycle_count,
-            raw_local_latency_s=raw_local_latency_s,
-        )
+        if recorder is not None and self.recording_name is not None:
+            recorder.record_operator_mapping_trial(
+                operator_name=self.recording_name,
+                operator_type="Matmul",
+                execution_kind=execution_kind,
+                graph={"M": self.computational_graph.M, "N": self.computational_graph.N, "K": self.computational_graph.K},
+                mapping=mapping,
+                cycle_count=cycle_count,
+                raw_local_latency_s=raw_local_latency_s,
+            )
+        trial_sink = trial_sink or getattr(self, "_active_trial_sink", None)
+        if trial_sink is not None:
+            if candidate is None:
+                candidate = self._make_transfer_candidate(mapping, strategy, execution_kind)
+            modifiers = get_trial_latency_modifiers()
+            effective = float(raw_local_latency_s) * float(modifiers["multiplier"]) + float(modifiers["additive_s"])
+            trial_sink(candidate.to_dict() if hasattr(candidate, "to_dict") else candidate, effective, cycle_count, modifiers.get("strategy") or strategy)
 
     def simulate(
         self,

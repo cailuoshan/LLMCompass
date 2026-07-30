@@ -204,39 +204,39 @@ class TransformerBlockInitComputationTP(Operator):
         )
         return self.roofline_latency
 
-    def compile_and_simulate(self, system: System, compile_mode: str):
+    def compile_and_simulate(self, system: System, compile_mode: str, provider=None, stage=None, hardware=None, trial_sink=None):
         device = system.device
         interconnect = system.interconnect
 
         # matmul
         print("simulating qkv")
         qkv_latency = 3 * (
-            self.Q_proj.compile_and_simulate(device, compile_mode)
+            self.Q_proj.compile_and_simulate(device, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + device.compute_module.overhead.matmul
         )
         print("simulating q_mul_k")
         q_mul_k_latency = (
-            self.Q_mul_K.compile_and_simulate(device, compile_mode)
+            self.Q_mul_K.compile_and_simulate(device, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + device.compute_module.overhead.matmul
         )
         print("simulating a_mul_v")
         a_mul_v_latency = (
-            self.A_mul_V.compile_and_simulate(device, compile_mode)
+            self.A_mul_V.compile_and_simulate(device, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + device.compute_module.overhead.matmul
         )
         print("simulating h_matmul0")
         h_matmul0_latency = (
-            self.H_matmul0.compile_and_simulate(device, compile_mode)
+            self.H_matmul0.compile_and_simulate(device, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + device.compute_module.overhead.matmul
         )
         print("simulating h1_matmul1")
         h1_matmul1_latency = (
-            self.H_matmul1.compile_and_simulate(device, compile_mode)
+            self.H_matmul1.compile_and_simulate(device, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + device.compute_module.overhead.matmul
         )
         print("simulating h2_matmul2")
         h2_matmul2_latency = (
-            self.H_matmul2.compile_and_simulate(device, compile_mode)
+            self.H_matmul2.compile_and_simulate(device, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + device.compute_module.overhead.matmul
         )
         print("finish matmul simulation")
@@ -252,11 +252,11 @@ class TransformerBlockInitComputationTP(Operator):
 
         # normalization
         softmax_latency = (
-            self.A_softmax.compile_and_simulate(device, compile_mode)
+            self.A_softmax.compile_and_simulate(device, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + device.compute_module.overhead.softmax
         )
         layernorm_latency = (
-            self.layer_norm0.compile_and_simulate(device, compile_mode)
+            self.layer_norm0.compile_and_simulate(device, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + device.compute_module.overhead.layernorm
         )
 
@@ -574,39 +574,39 @@ class TransformerBlockAutoRegressionTP(Operator):
         self.roofline_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {gelu_latency}, {allreduce_latency}, {allreduce_latency}"
         return self.roofline_latency
 
-    def compile_and_simulate(self, system: System, compile_mode: str):
+    def compile_and_simulate(self, system: System, compile_mode: str, provider=None, stage=None, hardware=None, trial_sink=None):
         pcb = system.device
         interconnect = system.interconnect
 
         # matmul
         # print("simulating qkv")
         qkv_latency = 3 * (
-            self.Q_proj.compile_and_simulate(pcb, compile_mode)
+            self.Q_proj.compile_and_simulate(pcb, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + pcb.compute_module.overhead.matmul
         )
         # print("simulating q_mul_k")
         q_mul_k_latency = (
-            self.Q_mul_K.compile_and_simulate(pcb, compile_mode)
+            self.Q_mul_K.compile_and_simulate(pcb, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + pcb.compute_module.overhead.matmul
         )
         # print("simulating a_mul_v")
         a_mul_v_latency = (
-            self.A_mul_V.compile_and_simulate(pcb, compile_mode)
+            self.A_mul_V.compile_and_simulate(pcb, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + pcb.compute_module.overhead.matmul
         )
         # print("simulating h_matmul0")
         h_matmul0_latency = (
-            self.H_matmul0.compile_and_simulate(pcb, compile_mode)
+            self.H_matmul0.compile_and_simulate(pcb, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + pcb.compute_module.overhead.matmul
         )
         # print("simulating h1_matmul1")
         h1_matmul1_latency = (
-            self.H_matmul1.compile_and_simulate(pcb, compile_mode)
+            self.H_matmul1.compile_and_simulate(pcb, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + pcb.compute_module.overhead.matmul
         )
         # print("simulating h2_matmul2")
         h2_matmul2_latency = (
-            self.H_matmul2.compile_and_simulate(pcb, compile_mode)
+            self.H_matmul2.compile_and_simulate(pcb, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + pcb.compute_module.overhead.matmul
         )
 
@@ -621,11 +621,11 @@ class TransformerBlockAutoRegressionTP(Operator):
 
         # normalization
         softmax_latency = (
-            self.A_softmax.compile_and_simulate(pcb, compile_mode)
+            self.A_softmax.compile_and_simulate(pcb, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + pcb.compute_module.overhead.softmax
         )
         layernorm_latency = (
-            self.layer_norm0.compile_and_simulate(pcb, compile_mode)
+            self.layer_norm0.compile_and_simulate(pcb, compile_mode, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink)
             + pcb.compute_module.overhead.layernorm
         )
 

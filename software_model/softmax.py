@@ -1,7 +1,7 @@
 from llmcompass_utils import size
 from typing import List, Tuple
 from hardware_model.device import Device
-from software_model.design_point_recorder import get_active_recorder
+from software_model.design_point_recorder import get_active_recorder, get_trial_latency_modifiers
 from software_model.operators import Operator
 from software_model.utils import Tensor, DataType
 from math import ceil, log2
@@ -9,6 +9,7 @@ import torch
 import time
 import statistics
 import numpy as np
+from software_model.search_protocol import MappingCandidate, ProviderProtocolError, deduplicate_candidates, validate_ranked_ids
 
 
 class Softmax(Operator):
@@ -64,7 +65,10 @@ class Softmax(Operator):
         self.roofline_latency=max(self.io_count/min(pcb_module.io_module.bandwidth, pcb_module.compute_module.l2_bandwidth_per_cycle*pcb_module.compute_module.clock_freq), self.flop_count/pcb_module.compute_module.total_vector_flops)
         return self.roofline_latency
 
-    def compile_and_simulate(self, pcb_module: Device, compile_mode=None):
+    def compile_and_simulate(self, pcb_module: Device, compile_mode=None, provider=None, stage=None, hardware=None, trial_sink=None, operator_name=None):
+        if compile_mode == "transfer-learn":
+            return self._compile_and_simulate_transfer_learn(pcb_module, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink, operator_name=operator_name)
+        self._active_trial_sink = trial_sink
         self.computational_graph.data_type = pcb_module.compute_module.core.vector_unit.data_type
         min_cycle_count = float("inf")
         best_mapping = None
@@ -119,12 +123,82 @@ class Softmax(Operator):
                     if cycle_count < min_cycle_count:
                         min_cycle_count = cycle_count
                         best_mapping = mapping
+                    if trial_sink is not None:
+                        trial_sink(self._candidate(mapping).to_dict(), float(cycle_count / pcb_module.compute_module.clock_freq), cycle_count, get_trial_latency_modifiers().get("strategy"))
         self.best_mapping = best_mapping
         self.best_cycle_count = min_cycle_count
         self.best_latency = min_cycle_count / pcb_module.compute_module.clock_freq
         self.execution_kind = "tiled_mapping"
         self.latency = self.best_latency
         # self.best_mapping.display()
+        return self.latency
+
+    def _candidate(self, mapping):
+        return MappingCandidate(
+            operator_name=self.recording_name or "Softmax",
+            operator_type="Softmax",
+            execution_kind="tiled_mapping",
+            strategy=None,
+            graph={"M": self.M, "N": self.N},
+            mapping=dict(vars(mapping)),
+            mapping_object=mapping,
+        )
+
+    def enumerate_transfer_candidates(self, pcb_module: Device, generation_mode="heuristic-GPU"):
+        if generation_mode not in ("heuristic-GPU", "exhaustive"):
+            raise ValueError("transfer candidate generation supports heuristic-GPU or exhaustive")
+        M, N = self.computational_graph.M, self.computational_graph.N
+        data_type = pcb_module.compute_module.core.vector_unit.data_type
+        l2_tile_N = N
+        l2_tile_M = min(pcb_module.compute_module.l2_size // (l2_tile_N * data_type.word_size), M)
+        if l2_tile_M <= 0:
+            raise ValueError("invalid Softmax L2 tile")
+        result = []
+        for factor in [1, 2, 4, 8, 16, 32]:
+            l1_tile_N = ceil(l2_tile_N / factor)
+            for l1_tile_M in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+                for double_buffer in (True, False):
+                    limit = pcb_module.compute_module.core.SRAM_size // (2 if double_buffer else 1)
+                    if l1_tile_M * l1_tile_N * data_type.word_size > limit:
+                        continue
+                    result.append(self._candidate(self.Mapping(l2_tile_M, l2_tile_N, False, l1_tile_M, l1_tile_N, double_buffer)))
+        result = deduplicate_candidates(result)
+        if not result:
+            raise ValueError("transfer candidate enumeration returned no Softmax mappings")
+        return result
+
+    def evaluate_transfer_candidate(self, pcb_module, candidate, trial_sink=None):
+        candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate(**candidate)
+        cycle_count = self.simulate(self.computational_graph, candidate.mapping_object, pcb_module)
+        latency = cycle_count / pcb_module.compute_module.clock_freq
+        recorder = get_active_recorder()
+        if recorder is not None and self.recording_name is not None:
+            recorder.record_operator_mapping_trial(operator_name=self.recording_name, operator_type="Softmax", execution_kind="tiled_mapping", graph={"M": self.M, "N": self.N}, mapping=candidate.mapping_object, cycle_count=cycle_count, raw_local_latency_s=latency)
+        if trial_sink is not None:
+            trial_sink(candidate.to_dict(), latency, cycle_count, None)
+        self.best_mapping, self.best_cycle_count, self.best_latency = candidate.mapping_object, cycle_count, latency
+        self.execution_kind, self.latency = "tiled_mapping", latency
+        return latency
+
+    def _compile_and_simulate_transfer_learn(self, pcb_module, provider=None, stage=None, hardware=None, trial_sink=None, operator_name=None):
+        if provider is None:
+            raise ProviderProtocolError("transfer-learn requires a provider")
+        candidates = self.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"))
+        records = [candidate.to_dict() for candidate in candidates]
+        top_k = getattr(provider, "top_k", "all")
+        selected = validate_ranked_ids(records, provider.rank(operator_name or self.recording_name or "Softmax", stage, hardware or {}, {}, records, top_k), top_k)
+        by_id = {candidate.candidate_id: candidate for candidate in candidates}
+        best = None
+        for candidate_id in selected:
+            try:
+                latency = self.evaluate_transfer_candidate(pcb_module, by_id[candidate_id], trial_sink)
+            except Exception as exc:
+                raise RuntimeError("transfer candidate evaluation failed: stage={}, operator={}, candidate_id={}".format(stage, operator_name or self.recording_name, candidate_id)) from exc
+            if best is None or latency < best[0]:
+                best = latency, by_id[candidate_id]
+        if best is None:
+            raise ProviderProtocolError("provider selected no Softmax candidate")
+        self.best_latency, self.best_mapping, self.latency = best[0], best[1].mapping_object, best[0]
         return self.latency
 
     def simulate(
