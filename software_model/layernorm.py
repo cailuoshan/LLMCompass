@@ -188,8 +188,9 @@ class LayerNorm(Operator):
             raise ProviderProtocolError("transfer-learn requires a provider")
         candidates = self.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"))
         records = [candidate.to_dict() for candidate in candidates]
-        top_k = getattr(provider, "top_k", "all")
-        selected = validate_ranked_ids(records, provider.rank(operator_name or self.recording_name or "LayerNorm", stage, hardware or {}, {}, records, top_k), top_k)
+        top_k = getattr(provider, "top_k", 1)
+        ranked = provider.rank(operator_name or self.recording_name or "LayerNorm", stage, hardware or {}, {}, records, top_k)
+        selected = validate_ranked_ids(records, ranked, top_k)
         by_id = {candidate.candidate_id: candidate for candidate in candidates}
         best = None
         for candidate_id in selected:

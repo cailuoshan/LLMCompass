@@ -103,6 +103,8 @@ def validate_ranked_ids(candidates: Iterable[Dict[str, Any]], ranked_ids: Iterab
     records = list(candidates)
     if not records:
         raise ProviderProtocolError("candidate set is empty")
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+        raise ProviderProtocolError("top_k must be a positive integer")
     ids = [record.get("candidate_id") for record in records]
     if any(not value for value in ids):
         raise ProviderProtocolError("candidate is missing candidate_id")
@@ -116,13 +118,8 @@ def validate_ranked_ids(candidates: Iterable[Dict[str, Any]], ranked_ids: Iterab
     unknown = [value for value in selected if value not in set(ids)]
     if unknown:
         raise ProviderProtocolError("provider returned unknown candidate ids: {}".format(unknown))
-    if top_k != "all":
-        try:
-            limit = int(top_k)
-        except (TypeError, ValueError):
-            raise ProviderProtocolError("top_k must be a positive integer or 'all'")
-        if limit < 1 or len(selected) > limit:
-            raise ProviderProtocolError("provider returned {} ids for top_k={}".format(len(selected), top_k))
+    if len(selected) > top_k:
+        raise ProviderProtocolError("provider returned {} ids for top_k={}".format(len(selected), top_k))
     if not selected:
         raise ProviderProtocolError("provider returned an empty ranking")
     return selected

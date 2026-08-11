@@ -122,7 +122,7 @@ class BatchedMatmul(Operator):
             base(Tensor([self.M, k]), Tensor([k, self.N]))
             candidates.extend(base.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"), strategy=strategy))
         records = [candidate.to_dict() for candidate in candidates]
-        top_k = getattr(provider, "top_k", "all")
+        top_k = getattr(provider, "top_k", 1)
         selected_ids = provider.rank(operator_name or self.recording_name or "BatchedMatmul", stage, hardware or {}, {}, records, top_k)
         selected_ids = validate_ranked_ids(records, selected_ids, top_k)
         by_id = {candidate.candidate_id: candidate for candidate in candidates}
@@ -954,7 +954,7 @@ class Matmul(Operator):
             raise ProviderProtocolError("transfer-learn requires a provider")
         candidates = self.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"))
         records = [candidate.to_dict() for candidate in candidates]
-        top_k = getattr(provider, "top_k", "all")
+        top_k = getattr(provider, "top_k", 1)
         selected_ids = provider.rank(operator_name or self.recording_name or "Matmul", stage, hardware or {}, {}, records, top_k)
         selected_ids = validate_ranked_ids(records, selected_ids, top_k)
         by_id = {candidate.candidate_id: candidate for candidate in candidates}
