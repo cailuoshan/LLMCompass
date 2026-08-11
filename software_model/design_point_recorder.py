@@ -29,7 +29,6 @@ TASK_COLUMNS = (
     "n_heads",
     "input_seq_len",
     "data_type",
-    "n_layers",
 )
 MATMUL_OPERATORS = (
     "QKV_proj",
@@ -246,7 +245,6 @@ class DesignPointRecorder:
             "n_heads INTEGER NOT NULL",
             "input_seq_len INTEGER NOT NULL",
             "data_type TEXT NOT NULL",
-            "n_layers INTEGER NOT NULL",
             "latency_s REAL NOT NULL",
             "total_area_mm2 REAL NOT NULL",
             "area_mm2_compute REAL",
