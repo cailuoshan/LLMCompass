@@ -9,7 +9,7 @@ import torch
 import time
 import statistics
 import numpy as np
-from software_model.search_protocol import MappingCandidate, ProviderProtocolError, deduplicate_candidates, validate_ranked_ids
+from software_model.search_protocol import MappingCandidate, ProviderProtocolError, deduplicate_candidates, execute_provider_search
 
 
 class Softmax(Operator):
@@ -186,20 +186,35 @@ class Softmax(Operator):
         candidates = self.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"))
         records = [candidate.to_dict() for candidate in candidates]
         top_k = getattr(provider, "top_k", 1)
-        ranked = provider.rank(operator_name or self.recording_name or "Softmax", stage, hardware or {}, {}, records, top_k)
-        selected = validate_ranked_ids(records, ranked, top_k)
+        search_operator_name = operator_name or self.recording_name or "Softmax"
         by_id = {candidate.candidate_id: candidate for candidate in candidates}
-        best = None
-        for candidate_id in selected:
+        evaluations = {}
+
+        def evaluate_candidate(candidate_id):
             try:
                 latency = self.evaluate_transfer_candidate(pcb_module, by_id[candidate_id], trial_sink)
             except Exception as exc:
                 raise RuntimeError("transfer candidate evaluation failed: stage={}, operator={}, candidate_id={}".format(stage, operator_name or self.recording_name, candidate_id)) from exc
-            if best is None or latency < best[0]:
-                best = latency, by_id[candidate_id]
-        if best is None:
-            raise ProviderProtocolError("provider selected no Softmax candidate")
-        self.best_latency, self.best_mapping, self.latency = best[0], best[1].mapping_object, best[0]
+            evaluations[candidate_id] = latency
+            return latency
+
+        evaluated_ids = execute_provider_search(
+            provider,
+            search_operator_name,
+            stage,
+            hardware or {},
+            {},
+            records,
+            top_k,
+            evaluate_candidate,
+        )
+        best_id = min(
+            evaluated_ids,
+            key=lambda candidate_id: (evaluations[candidate_id], candidate_id),
+        )
+        self.best_latency = evaluations[best_id]
+        self.best_mapping = by_id[best_id].mapping_object
+        self.latency = self.best_latency
         return self.latency
 
     def simulate(

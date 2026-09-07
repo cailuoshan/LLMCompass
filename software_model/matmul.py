@@ -21,7 +21,7 @@ from software_model.search_protocol import (
     MappingCandidate,
     ProviderProtocolError,
     deduplicate_candidates,
-    validate_ranked_ids,
+    execute_provider_search,
 )
 
 
@@ -123,11 +123,11 @@ class BatchedMatmul(Operator):
             candidates.extend(base.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"), strategy=strategy))
         records = [candidate.to_dict() for candidate in candidates]
         top_k = getattr(provider, "top_k", 1)
-        selected_ids = provider.rank(operator_name or self.recording_name or "BatchedMatmul", stage, hardware or {}, {}, records, top_k)
-        selected_ids = validate_ranked_ids(records, selected_ids, top_k)
+        search_operator_name = operator_name or self.recording_name or "BatchedMatmul"
         by_id = {candidate.candidate_id: candidate for candidate in candidates}
-        best = None
-        for candidate_id in selected_ids:
+        evaluations = {}
+
+        def evaluate_candidate(candidate_id):
             candidate = by_id[candidate_id]
             base = Matmul(self.data_type)
             base.recording_name = self.recording_name
@@ -145,10 +145,23 @@ class BatchedMatmul(Operator):
                     latency = raw + extra
             except Exception as exc:
                 raise RuntimeError("transfer candidate evaluation failed: stage={}, operator={}, candidate_id={}".format(stage, operator_name or self.recording_name, candidate_id)) from exc
-            if best is None or latency < best[0]:
-                best = (latency, candidate, base)
-        if best is None:
-            raise ProviderProtocolError("provider selected no batched matmul candidates")
+            evaluations[candidate_id] = (latency, candidate, base)
+            return latency
+
+        evaluated_ids = execute_provider_search(
+            provider,
+            search_operator_name,
+            stage,
+            hardware or {},
+            {},
+            records,
+            top_k,
+            evaluate_candidate,
+        )
+        best = min(
+            (evaluations[candidate_id] for candidate_id in evaluated_ids),
+            key=lambda item: (item[0], item[1].candidate_id),
+        )
         self.best_latency, selected, base = best
         self.selected_strategy = selected.strategy
         self.best_mapping = base.best_mapping
@@ -955,20 +968,37 @@ class Matmul(Operator):
         candidates = self.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"))
         records = [candidate.to_dict() for candidate in candidates]
         top_k = getattr(provider, "top_k", 1)
-        selected_ids = provider.rank(operator_name or self.recording_name or "Matmul", stage, hardware or {}, {}, records, top_k)
-        selected_ids = validate_ranked_ids(records, selected_ids, top_k)
+        search_operator_name = operator_name or self.recording_name or "Matmul"
         by_id = {candidate.candidate_id: candidate for candidate in candidates}
-        best = None
-        for candidate_id in selected_ids:
+        evaluations = {}
+
+        def evaluate_candidate(candidate_id):
             try:
                 latency = self.evaluate_transfer_candidate(pcb_module, by_id[candidate_id], trial_sink=trial_sink)
             except Exception as exc:
                 raise RuntimeError("transfer candidate evaluation failed: stage={}, operator={}, candidate_id={}".format(stage, operator_name or self.recording_name, candidate_id)) from exc
-            if best is None or latency < best[0]:
-                best = (latency, by_id[candidate_id])
-        if best is None:
-            raise ProviderProtocolError("provider selected no candidates for {}".format(operator_name or self.recording_name))
-        self.best_latency, self.best_mapping = best[0], best[1].mapping_object
+            evaluations[candidate_id] = latency
+            return latency
+
+        evaluated_ids = execute_provider_search(
+            provider,
+            search_operator_name,
+            stage,
+            hardware or {},
+            {},
+            records,
+            top_k,
+            evaluate_candidate,
+        )
+        best_id = min(
+            evaluated_ids,
+            key=lambda candidate_id: (
+                evaluations[candidate_id],
+                candidate_id,
+            ),
+        )
+        self.best_latency = evaluations[best_id]
+        self.best_mapping = by_id[best_id].mapping_object
         self.latency = self.best_latency
         return self.latency
 

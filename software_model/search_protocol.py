@@ -125,6 +125,56 @@ def validate_ranked_ids(candidates: Iterable[Dict[str, Any]], ranked_ids: Iterab
     return selected
 
 
+def execute_provider_search(
+    provider,
+    operator_name: str,
+    stage: str,
+    hardware: Dict[str, Any],
+    operator: Dict[str, Any],
+    candidates: Iterable[Dict[str, Any]],
+    top_k: int,
+    evaluate_candidate,
+) -> List[str]:
+    """Run an in-process provider search while keeping operator evaluation local."""
+    records = list(candidates)
+    if not records:
+        raise ProviderProtocolError("candidate set is empty")
+    if not callable(evaluate_candidate):
+        raise ProviderProtocolError("evaluate_candidate must be callable")
+
+    search = getattr(provider, "search_and_evaluate", None)
+    if callable(search):
+        evaluated_ids = search(
+            operator_name,
+            stage,
+            hardware,
+            operator,
+            records,
+            top_k,
+            evaluate_candidate,
+        )
+    else:
+        ranked_ids = provider.rank(
+            operator_name, stage, hardware, operator, records, top_k
+        )
+        evaluated_ids = validate_ranked_ids(records, ranked_ids, top_k)
+        for candidate_id_value in evaluated_ids:
+            evaluate_candidate(candidate_id_value)
+
+    evaluated_ids = list(evaluated_ids or [])
+    candidate_ids = {record.get("candidate_id") for record in records}
+    if not evaluated_ids:
+        raise ProviderProtocolError("provider evaluated no candidates")
+    if len(set(evaluated_ids)) != len(evaluated_ids):
+        raise ProviderProtocolError("provider evaluated duplicate candidate ids")
+    unknown = [value for value in evaluated_ids if value not in candidate_ids]
+    if unknown:
+        raise ProviderProtocolError(
+            "provider evaluated unknown candidate ids: {}".format(unknown)
+        )
+    return evaluated_ids
+
+
 def deduplicate_candidates(candidates: Iterable[MappingCandidate]) -> List[MappingCandidate]:
     """Remove equivalent candidates while preserving deterministic enum order.
 
