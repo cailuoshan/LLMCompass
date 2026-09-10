@@ -2,9 +2,10 @@ from llmcompass_utils import size, closest_factors
 from typing import List, Tuple, Union
 from hardware_model.device import Device
 from software_model.utils import Tensor, DataType
+from software_model.search_protocol import SearchableOperator
 
 
-class Operator:
+class Operator(SearchableOperator):
     def __init__(
         self,
         flop_count,

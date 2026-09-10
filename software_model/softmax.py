@@ -12,6 +12,37 @@ import numpy as np
 from software_model.search_protocol import MappingCandidate, ProviderProtocolError, deduplicate_candidates, validate_ranked_ids
 
 
+def estimate_analytical_softmax_cycles(element_count, pcb_module):
+    """Ideal per-core cost shared by materialized and online Softmax."""
+    vector_unit = pcb_module.compute_module.core.vector_unit
+    flops_per_element = vector_unit.flops_per_exp * 3 + 7
+    return max(
+        1,
+        ceil(
+            int(element_count)
+            * flops_per_element
+            / vector_unit.total_vector_flops_per_cycle
+        ),
+    )
+
+
+def estimate_analytical_online_state_cycles(row_count, first, pcb_module):
+    """Extra running-max/sum work needed after the first score tile."""
+    if first:
+        return 0
+    vector_unit = pcb_module.compute_module.core.vector_unit
+    # Per row: max, subtract, alpha exp, multiply, and add.
+    flops_per_row = vector_unit.flops_per_exp + 4
+    return max(
+        1,
+        ceil(
+            int(row_count)
+            * flops_per_row
+            / vector_unit.total_vector_flops_per_cycle
+        ),
+    )
+
+
 class Softmax(Operator):
     def __init__(self, data_type: DataType):
         super().__init__(0, 0, 0, 0, data_type)
@@ -142,6 +173,9 @@ class Softmax(Operator):
             graph={"M": self.M, "N": self.N},
             mapping=dict(vars(mapping)),
             mapping_object=mapping,
+            precision={"word_size": self.computational_graph.data_type.word_size, "exp": "modeled", "accuracy_class": "bounded_ulp"},
+            layout={"contiguous_last_dim": True},
+            resource_requirements={"l1_bytes": mapping.l1_tile_M * mapping.l1_tile_N * self.computational_graph.data_type.word_size},
         )
 
     def enumerate_transfer_candidates(self, pcb_module: Device, generation_mode="heuristic-GPU"):
@@ -168,12 +202,14 @@ class Softmax(Operator):
         return result
 
     def evaluate_transfer_candidate(self, pcb_module, candidate, trial_sink=None):
-        candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate(**candidate)
+        candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate.from_dict(candidate)
+        if candidate.mapping_object is None:
+            candidate.mapping_object = self.Mapping(**candidate.mapping)
         cycle_count = self.simulate(self.computational_graph, candidate.mapping_object, pcb_module)
         latency = cycle_count / pcb_module.compute_module.clock_freq
         recorder = get_active_recorder()
         if recorder is not None and self.recording_name is not None:
-            recorder.record_operator_mapping_trial(operator_name=self.recording_name, operator_type="Softmax", execution_kind="tiled_mapping", graph={"M": self.M, "N": self.N}, mapping=candidate.mapping_object, cycle_count=cycle_count, raw_local_latency_s=latency)
+            recorder.record_operator_mapping_trial(operator_name=self.recording_name, operator_type="Softmax", execution_kind="tiled_mapping", graph={"M": self.M, "N": self.N}, mapping=candidate.mapping_object, cycle_count=cycle_count, raw_local_latency_s=latency, candidate=candidate)
         if trial_sink is not None:
             trial_sink(candidate.to_dict(), latency, cycle_count, None)
         self.best_mapping, self.best_cycle_count, self.best_latency = candidate.mapping_object, cycle_count, latency
@@ -373,12 +409,7 @@ class Softmax(Operator):
             mapping: "Softmax.Mapping",
             pcb_module: Device,
         ):
-            # online softmax
-            total_flop_count = M * N * (self.flops_per_exp * 3 + 7)
-            return ceil(
-                total_flop_count
-                / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
-            )
+            return estimate_analytical_softmax_cycles(M * N, pcb_module)
 
     def run_on_gpu(self):
         assert self.shape is not None

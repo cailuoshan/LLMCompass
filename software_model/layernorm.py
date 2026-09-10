@@ -9,7 +9,7 @@ import time
 import statistics
 import numpy as np
 import torch
-from software_model.search_protocol import MappingCandidate, ProviderProtocolError, validate_ranked_ids
+from software_model.search_protocol import MappingCandidate, ProviderProtocolError, deduplicate_candidates, validate_ranked_ids
 
 
 @torch.compile
@@ -151,32 +151,52 @@ class LayerNorm(Operator):
         return self.latency
 
     def enumerate_transfer_candidates(self, pcb_module: Device, generation_mode="heuristic-GPU"):
-        if generation_mode == "exhaustive":
-            raise NotImplementedError("Exhaustive search is not implemented for LayerNorm")
-        if generation_mode not in ("heuristic-GPU", "heuristic-our-throughput", "heuristic-TPU"):
+        if generation_mode not in ("heuristic-GPU", "heuristic-our-throughput", "heuristic-TPU", "exhaustive"):
             raise ValueError("unsupported LayerNorm transfer candidate generation mode")
         data_type = pcb_module.compute_module.core.vector_unit.data_type
         M, N = self.computational_graph.M, self.computational_graph.N
         l2_tile_N = N
         l2_tile_M = min(pcb_module.compute_module.l2_size // (l2_tile_N * data_type.word_size) // 2, M)
-        l1_tile_N = N
-        l1_tile_M = pcb_module.compute_module.core.SRAM_size // (2 * l1_tile_N * data_type.word_size)
-        while l1_tile_M < pcb_module.compute_module.core.vector_unit.vector_count:
-            l1_tile_N //= 2
-            if l1_tile_N <= 0:
-                raise ValueError("invalid LayerNorm L1 tile")
-            l1_tile_M = pcb_module.compute_module.core.SRAM_size // (2 * l1_tile_N * data_type.word_size)
-        l1_tile_M = min(l1_tile_M, l2_tile_M)
-        mapping = self.Mapping(l2_tile_M, l2_tile_N, l1_tile_M, l1_tile_N)
-        return [MappingCandidate(operator_name=self.recording_name or "LayerNorm", operator_type="LayerNorm", execution_kind="tiled_mapping", strategy=None, graph={"M": M, "N": N}, mapping=dict(vars(mapping)), mapping_object=mapping)]
+        if l2_tile_M <= 0:
+            raise ValueError("invalid LayerNorm L2 tile")
+        vector_count = pcb_module.compute_module.core.vector_unit.vector_count
+        row_tiles = [1, 2, 4, 8, 16, 32, 64, 128, 256, l2_tile_M]
+        candidates = []
+        for factor in [1, 2, 4, 8, 16, 32]:
+            l1_tile_N = ceil(N / factor)
+            for l1_tile_M in row_tiles:
+                if l1_tile_M <= 0 or l1_tile_M > l2_tile_M:
+                    continue
+                for double_buffer in (True, False):
+                    required_bytes = l1_tile_M * l1_tile_N * data_type.word_size
+                    limit = pcb_module.compute_module.core.SRAM_size // (2 if double_buffer else 1)
+                    if required_bytes > limit:
+                        continue
+                    mapping = self.Mapping(l2_tile_M, l2_tile_N, l1_tile_M, l1_tile_N)
+                    mapping.is_l1_double_buffering = double_buffer
+                    candidates.append(MappingCandidate(
+                        operator_name=self.recording_name or "LayerNorm",
+                        operator_type="LayerNorm", execution_kind="tiled_mapping", strategy=None,
+                        graph={"M": M, "N": N}, mapping=dict(vars(mapping)), mapping_object=mapping,
+                        precision={"word_size": data_type.word_size, "accumulator": "fp32", "accuracy_class": "exact"},
+                        layout={"contiguous_last_dim": True},
+                        resource_requirements={"sram_bytes": required_bytes, "vector_count": vector_count},
+                    ))
+        candidates = deduplicate_candidates(candidates)
+        if not candidates:
+            raise ValueError("transfer candidate enumeration returned no LayerNorm mappings")
+        return candidates
 
     def evaluate_transfer_candidate(self, pcb_module, candidate, trial_sink=None):
-        candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate(**candidate)
+        candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate.from_dict(candidate)
+        if candidate.mapping_object is None:
+            mapping_fields = {key: candidate.mapping[key] for key in ("l2_tile_M", "l2_tile_N", "l1_tile_M", "l1_tile_N")}
+            candidate.mapping_object = self.Mapping(**mapping_fields)
         cycle_count = self.simulate(self.computational_graph, candidate.mapping_object, pcb_module)
         latency = cycle_count / pcb_module.compute_module.clock_freq
         recorder = get_active_recorder()
         if recorder is not None and self.recording_name is not None:
-            recorder.record_operator_mapping_trial(operator_name=self.recording_name, operator_type="LayerNorm", execution_kind="tiled_mapping", graph={"M": self.M, "N": self.N}, mapping=candidate.mapping_object, cycle_count=cycle_count, raw_local_latency_s=latency)
+            recorder.record_operator_mapping_trial(operator_name=self.recording_name, operator_type="LayerNorm", execution_kind="tiled_mapping", graph={"M": self.M, "N": self.N}, mapping=candidate.mapping_object, cycle_count=cycle_count, raw_local_latency_s=latency, candidate=candidate)
         if trial_sink is not None:
             trial_sink(candidate.to_dict(), latency, cycle_count, None)
         self.best_mapping, self.best_cycle_count, self.best_latency = candidate.mapping_object, cycle_count, latency

@@ -1,12 +1,12 @@
-"""Stable JSON protocol between LLMCompass and an external search provider.
-
-This module intentionally knows nothing about ``funcs`` or the transfer model.
-"""
+"""Stable JSON protocol between LLMCompass and an external search provider."""
 
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
+
+
+Strategy = Optional[Union[str, Dict[str, Any]]]
 
 
 def _json_value(value: Any) -> Any:
@@ -28,20 +28,18 @@ def mapping_to_dict(mapping: Any) -> Dict[str, Any]:
         return {}
     if isinstance(mapping, dict):
         return {str(key): _json_value(value) for key, value in mapping.items()}
-    return {
-        str(key): _json_value(value)
-        for key, value in vars(mapping).items()
-        if not str(key).startswith("_")
-    }
+    return {str(key): _json_value(value) for key, value in vars(mapping).items() if not str(key).startswith("_")}
 
 
-def candidate_id(operator_name: str, execution_kind: str, strategy: Optional[str], mapping: Dict[str, Any]) -> str:
+def candidate_id(operator_name: str, execution_kind: str, strategy: Strategy, mapping: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> str:
     payload = {
         "operator_name": operator_name,
         "execution_kind": execution_kind,
         "strategy": strategy,
         "mapping": mapping_to_dict(mapping),
     }
+    if metadata:
+        payload["metadata"] = _json_value(metadata)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -51,17 +49,42 @@ class MappingCandidate:
     operator_name: str
     operator_type: str
     execution_kind: str
-    strategy: Optional[str]
+    strategy: Strategy
     graph: Dict[str, Any]
     mapping: Dict[str, Any]
     mapping_object: Any = field(default=None, repr=False, compare=False)
     candidate_id: str = ""
+    precision: Dict[str, Any] = field(default_factory=dict)
+    layout: Dict[str, Any] = field(default_factory=dict)
+    resource_requirements: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        expected = candidate_id(self.operator_name, self.execution_kind, self.strategy, self.mapping)
+        for name in ("graph", "mapping", "precision", "layout", "resource_requirements"):
+            if not isinstance(getattr(self, name), dict):
+                raise ProviderProtocolError("candidate {} must be a dictionary".format(name))
+        metadata = {key: value for key, value in {
+            "precision": self.precision,
+            "layout": self.layout,
+            "resource_requirements": self.resource_requirements,
+        }.items() if value}
+        expected = candidate_id(self.operator_name, self.execution_kind, self.strategy, self.mapping, metadata)
         if self.candidate_id and self.candidate_id != expected:
             raise ValueError("candidate_id does not match candidate fields")
         self.candidate_id = expected
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "MappingCandidate":
+        data = dict(value)
+        data.pop("schema_version", None)
+        legacy = any(key in data for key in ("resource_hint", "validity", "conditions", "valid", "invalid_reason"))
+        if "resource_requirements" not in data:
+            data["resource_requirements"] = data.get("resource_hint", {})
+        data.pop("resource_hint", None)
+        for key in ("validity", "conditions", "valid", "invalid_reason"):
+            data.pop(key, None)
+        if legacy:
+            data.pop("candidate_id", None)
+        return cls(**data)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -69,9 +92,12 @@ class MappingCandidate:
             "operator_name": self.operator_name,
             "operator_type": self.operator_type,
             "execution_kind": self.execution_kind,
-            "strategy": self.strategy,
+            "strategy": _json_value(self.strategy),
             "graph": _json_value(self.graph),
             "mapping": mapping_to_dict(self.mapping),
+            "precision": _json_value(self.precision),
+            "layout": _json_value(self.layout),
+            "resource_requirements": _json_value(self.resource_requirements),
         }
 
 
@@ -82,7 +108,7 @@ class TrialResult:
     measured: bool = True
     cycle_count: Optional[int] = None
     raw_local_latency_s: Optional[float] = None
-    strategy: Optional[str] = None
+    strategy: Strategy = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -99,6 +125,42 @@ class ProviderProtocolError(ValueError):
     pass
 
 
+class SearchableOperator:
+    """Common candidate interface exposed by software operators."""
+
+    def enumerate_transfer_candidates(self, pcb_module, generation_mode="heuristic-GPU"):
+        raise NotImplementedError
+
+    def evaluate_transfer_candidate(self, pcb_module, candidate, trial_sink=None):
+        raise NotImplementedError
+
+    @staticmethod
+    def validate_candidate(candidate: MappingCandidate) -> MappingCandidate:
+        if not isinstance(candidate, MappingCandidate):
+            candidate = MappingCandidate.from_dict(candidate)
+        return candidate
+
+
+def _flatten_features(prefix: str, value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            name = "{}.{}".format(prefix, key) if prefix else str(key)
+            result.update(_flatten_features(name, item))
+        return result
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return {prefix: value}
+    return {}
+
+
+def candidate_features(candidate: MappingCandidate) -> Dict[str, Any]:
+    candidate = SearchableOperator.validate_candidate(candidate)
+    features = _flatten_features("strategy", candidate.strategy)
+    for prefix, values in (("graph", candidate.graph), ("mapping", candidate.mapping), ("precision", candidate.precision), ("layout", candidate.layout), ("resource", candidate.resource_requirements)):
+        features.update(_flatten_features(prefix, values))
+    return features
+
+
 def validate_ranked_ids(candidates: Iterable[Dict[str, Any]], ranked_ids: Iterable[str], top_k: Any) -> List[str]:
     records = list(candidates)
     if not records:
@@ -110,9 +172,7 @@ def validate_ranked_ids(candidates: Iterable[Dict[str, Any]], ranked_ids: Iterab
         raise ProviderProtocolError("candidate is missing candidate_id")
     if len(set(ids)) != len(ids):
         raise ProviderProtocolError("candidate set contains duplicate candidate_id")
-    if ranked_ids is None:
-        raise ProviderProtocolError("provider returned no candidate ids")
-    selected = list(ranked_ids)
+    selected = list(ranked_ids) if ranked_ids is not None else []
     if len(set(selected)) != len(selected):
         raise ProviderProtocolError("provider returned duplicate candidate ids")
     unknown = [value for value in selected if value not in set(ids)]
@@ -126,13 +186,6 @@ def validate_ranked_ids(candidates: Iterable[Dict[str, Any]], ranked_ids: Iterab
 
 
 def deduplicate_candidates(candidates: Iterable[MappingCandidate]) -> List[MappingCandidate]:
-    """Remove equivalent candidates while preserving deterministic enum order.
-
-    Candidate generation may reach the same mapping through different factor
-    values, for example ``ceil(16 / 16) == ceil(16 / 32) == 1``.  Deduplication
-    belongs at the generation boundary; protocol validation must still reject
-    duplicates returned by an external provider.
-    """
     unique = []
     seen = set()
     for candidate in candidates:

@@ -396,6 +396,7 @@ class Matmul(Operator):
             self.best_cycle_count = None
             self.best_latency = self.latency
             self.execution_kind = "vector_fast_path"
+            self.selected_strategy = None
             self._record_trial(
                 pcb_module,
                 mapping=None,
@@ -842,26 +843,45 @@ class Matmul(Operator):
         else:
             raise ValueError(f"compile_mode {compile_mode} not supported")
         self.best_mapping = best_mapping
-        # if self.best_mapping is not None:
-        #     self.best_mapping.display()
         self.best_cycle_count = min_cycle_count
         self.best_latency = min_cycle_count / pcb_module.compute_module.clock_freq
         self.execution_kind = "tiled_mapping"
+        self.selected_strategy = None
         self.latency = self.best_latency
-        # self.best_mapping.display()
         return self.latency
 
     def _make_transfer_candidate(self, mapping, strategy=None, execution_kind="tiled_mapping"):
         name = self.recording_name or "Matmul"
         graph = {"M": self.computational_graph.M, "N": self.computational_graph.N, "K": self.computational_graph.K}
+        mapping_dict = (
+            {key: value for key, value in vars(mapping).items()}
+            if mapping is not None
+            else {}
+        )
+        word_size = self.computational_graph.data_type.word_size
+        working_set_bytes = 0
+        if mapping is not None:
+            working_set_bytes = (
+                mapping.l1_tile_M * mapping.l1_tile_K
+                + mapping.l1_tile_K * mapping.l1_tile_N
+                + mapping.l1_tile_M * mapping.l1_tile_N
+            ) * word_size
         return MappingCandidate(
             operator_name=name,
             operator_type="Matmul",
             execution_kind=execution_kind,
             strategy=strategy,
             graph=graph,
-            mapping={key: value for key, value in vars(mapping).items()} if mapping is not None else {},
+            mapping=mapping_dict,
             mapping_object=mapping,
+            precision={
+                "input_word_size": word_size,
+                "accumulator": "native",
+                "output_word_size": word_size,
+                "accuracy_class": "exact",
+            },
+            layout={"input": "row_major", "weight": "row_major", "output": "row_major"},
+            resource_requirements={"sram_bytes": working_set_bytes},
         )
 
     def enumerate_transfer_candidates(self, pcb_module: Device, generation_mode="heuristic-GPU", strategy=None):
@@ -927,7 +947,7 @@ class Matmul(Operator):
         return result
 
     def evaluate_transfer_candidate(self, pcb_module: Device, candidate, trial_sink=None):
-        candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate(**candidate)
+        candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate.from_dict(candidate)
         if candidate.execution_kind == "vector_fast_path":
             M, N, K = self.computational_graph.M, self.computational_graph.N, self.computational_graph.K
             working = (M * K + N * K + M * N) * self.data_type.word_size
@@ -946,6 +966,7 @@ class Matmul(Operator):
         self.best_cycle_count = cycle_count
         self.best_latency = latency
         self.execution_kind = candidate.execution_kind
+        self.selected_strategy = candidate.strategy
         self.latency = latency
         return latency
 
@@ -965,10 +986,15 @@ class Matmul(Operator):
             except Exception as exc:
                 raise RuntimeError("transfer candidate evaluation failed: stage={}, operator={}, candidate_id={}".format(stage, operator_name or self.recording_name, candidate_id)) from exc
             if best is None or latency < best[0]:
-                best = (latency, by_id[candidate_id])
+                best = (latency, by_id[candidate_id], self.best_cycle_count)
         if best is None:
             raise ProviderProtocolError("provider selected no candidates for {}".format(operator_name or self.recording_name))
-        self.best_latency, self.best_mapping = best[0], best[1].mapping_object
+        self.best_latency = best[0]
+        selected = best[1]
+        self.best_mapping = selected.mapping_object or selected.mapping
+        self.best_cycle_count = best[2]
+        self.execution_kind = selected.execution_kind
+        self.selected_strategy = selected.strategy
         self.latency = self.best_latency
         return self.latency
 
@@ -983,6 +1009,8 @@ class Matmul(Operator):
         candidate=None,
         trial_sink=None,
     ):
+        if candidate is None:
+            candidate = self._make_transfer_candidate(mapping, strategy, execution_kind)
         recorder = get_active_recorder()
         if raw_local_latency_s is None:
             raw_local_latency_s = (
@@ -997,11 +1025,10 @@ class Matmul(Operator):
                 mapping=mapping,
                 cycle_count=cycle_count,
                 raw_local_latency_s=raw_local_latency_s,
+                candidate=candidate,
             )
         trial_sink = trial_sink or getattr(self, "_active_trial_sink", None)
         if trial_sink is not None:
-            if candidate is None:
-                candidate = self._make_transfer_candidate(mapping, strategy, execution_kind)
             modifiers = get_trial_latency_modifiers()
             effective = float(raw_local_latency_s) * float(modifiers["multiplier"]) + float(modifiers["additive_s"])
             trial_sink(candidate.to_dict() if hasattr(candidate, "to_dict") else candidate, effective, cycle_count, modifiers.get("strategy") or strategy)

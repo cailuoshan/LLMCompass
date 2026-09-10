@@ -83,9 +83,20 @@ LAYERNORM_RESULT_FIELDS = (
     ("l1_tile_N", "INTEGER"),
     ("local_latency_s", "REAL"),
 )
+GELU_RESULT_FIELDS = (
+    ("mapping_source", "TEXT NOT NULL"),
+    ("execution_kind", "TEXT NOT NULL"),
+    ("M", "INTEGER"),
+    ("vector_factor", "INTEGER"),
+    ("local_latency_s", "REAL"),
+)
 
 TRIAL_COLUMNS = (
     "candidate_ordinal",
+    "candidate_id",
+    "precision_json",
+    "layout_json",
+    "resource_requirements_json",
     "operator_name",
     "operator_type",
     "execution_kind",
@@ -177,6 +188,7 @@ def _main_result_columns():
             (f"{operator}_{field}", sql_type)
             for field, sql_type in LAYERNORM_RESULT_FIELDS
         )
+    columns.extend((f"H_gelu_{field}", sql_type) for field, sql_type in GELU_RESULT_FIELDS)
     return tuple(columns)
 
 
@@ -282,6 +294,10 @@ class DesignPointRecorder:
             CREATE TABLE {table} (
                 trial_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_ordinal INTEGER NOT NULL UNIQUE,
+                candidate_id TEXT,
+                precision_json TEXT,
+                layout_json TEXT,
+                resource_requirements_json TEXT,
                 operator_name TEXT NOT NULL,
                 operator_type TEXT NOT NULL,
                 execution_kind TEXT NOT NULL,
@@ -337,21 +353,30 @@ class DesignPointRecorder:
         mapping: Any = None,
         cycle_count: Optional[int] = None,
         raw_local_latency_s: float = 0.0,
+        candidate: Any = None,
     ) -> None:
         if not self.context.enabled or not self.context.record_operator_trials:
             return
         graph = graph or {}
         mapping_dict = _mapping_to_dict(mapping)
+        candidate_dict = candidate.to_dict() if hasattr(candidate, "to_dict") else dict(candidate or {})
         modifiers = _TRIAL_LATENCY.get()
         multiplier = float(modifiers["multiplier"])
         additive_s = float(modifiers["additive_s"])
         raw_latency = float(raw_local_latency_s)
+        recorded_strategy = modifiers["strategy"] if modifiers["strategy"] is not None else candidate_dict.get("strategy")
+        if isinstance(recorded_strategy, (dict, list)):
+            recorded_strategy = _stable_json(recorded_strategy)
         row = {
             "candidate_ordinal": self._candidate_ordinal,
+            "candidate_id": candidate_dict.get("candidate_id"),
+            "precision_json": _stable_json(candidate_dict.get("precision", {})),
+            "layout_json": _stable_json(candidate_dict.get("layout", {})),
+            "resource_requirements_json": _stable_json(candidate_dict.get("resource_requirements", {})),
             "operator_name": operator_name,
             "operator_type": operator_type,
             "execution_kind": execution_kind,
-            "strategy": modifiers["strategy"],
+            "strategy": recorded_strategy,
             "M": graph.get("M"),
             "N": graph.get("N"),
             "K": graph.get("K"),
@@ -440,7 +465,7 @@ class DesignPointRecorder:
         self.connection.execute(
             f"INSERT INTO hwsw_design_points "
             f"({', '.join(columns)}) VALUES ({placeholders})",
-            tuple(_to_scalar(row[column]) for column in columns),
+            tuple(_stable_json(row[column]) if isinstance(row[column], (dict, list)) else _to_scalar(row[column]) for column in columns),
         )
         self.connection.commit()
         self._finalized = True

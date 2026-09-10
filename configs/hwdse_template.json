@@ -38,6 +38,14 @@
                     "fp32_count": 16,
                     "fp64_count": 8
                 },
+                "online_softmax": {
+                    "supports_vfexp2": true,
+                    "vfexp2_elements_per_cycle": 4,
+                    "vfexp2_latency_cycles": 6,
+                    "vector_register_count": 32,
+                    "max_lmul": 8,
+                    "calibration_profile": "xsai_vfexp2_2026_08"
+                },
                 "register_file": {
                     "num_reg_files": 1,
                     "num_registers": 16384,

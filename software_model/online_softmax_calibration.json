@@ -1,0 +1,47 @@
+{
+  "profile": "xsai_vfexp2_2026_08",
+  "measurement": {
+    "counter": "direct_rdcycle",
+    "fenced": false,
+    "warmup": 1,
+    "repeats": 1,
+    "source": "XSAI online-softmax measurement notes, sections 4.6 and 4.8"
+  },
+  "reference_hardware": {
+    "vfexp2_elements_per_cycle": 4,
+    "vfexp2_latency_cycles": 6,
+    "vector_register_count": 32
+  },
+  "reference_shape": {
+    "rows": 32,
+    "cols": 256,
+    "first": false,
+    "scale": 1.0
+  },
+  "variants": {
+    "rvv_poly_1row": {
+      "cycles": 49374,
+      "cycles_per_element": 6.026611328125
+    },
+    "vfexp2_1row_lmul8": {
+      "cycles": 23227,
+      "cycles_per_element": 2.8353271484375
+    },
+    "vfexp2_2row_lmul8_2k": {
+      "cycles": 16327,
+      "cycles_per_element": 1.9930419921875
+    },
+    "vfexp2_4row_lmul4_2k": {
+      "cycles": 14912,
+      "cycles_per_element": 1.8203125
+    },
+    "vfexp2_8row_lmul2_2k": {
+      "cycles": 15889,
+      "cycles_per_element": 1.9395751953125
+    },
+    "vfexp2_4row_positive_scale_vector_alpha": {
+      "cycles": 12224,
+      "cycles_per_element": 1.4921875
+    }
+  }
+}

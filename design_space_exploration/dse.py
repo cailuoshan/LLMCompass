@@ -33,6 +33,7 @@ def template_to_system(arch_specs):
     sublane_count = core_specs["sublane_count"]
     # vector unit
     vector_unit_specs = core_specs["vector_unit"]
+    online_softmax_specs = core_specs.get("online_softmax", {})
     vector_unit = VectorUnit(
         sublane_count
         * vector_unit_specs["vector_width"]
@@ -41,6 +42,12 @@ def template_to_system(arch_specs):
         35,
         vector_unit_specs["vector_width"],
         sublane_count,
+        supports_vfexp2=online_softmax_specs.get("supports_vfexp2", False),
+        vfexp2_elements_per_cycle=online_softmax_specs.get("vfexp2_elements_per_cycle", 0),
+        vfexp2_latency_cycles=online_softmax_specs.get("vfexp2_latency_cycles", 0),
+        vector_register_count=online_softmax_specs.get("vector_register_count", 32),
+        max_lmul=online_softmax_specs.get("max_lmul", 8),
+        online_softmax_calibration_profile=online_softmax_specs.get("calibration_profile"),
     )
     # systolic array
     systolic_array_specs = core_specs["systolic_array"]

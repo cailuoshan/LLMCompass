@@ -11,6 +11,12 @@ class VectorUnit:
         vector_width,
         vector_count,
         data_type=data_type_dict["fp16"],
+        supports_vfexp2=False,
+        vfexp2_elements_per_cycle=0,
+        vfexp2_latency_cycles=0,
+        vector_register_count=32,
+        max_lmul=8,
+        online_softmax_calibration_profile=None,
     ):
         self.total_vector_flops_per_cycle = total_vector_flops_per_cycle
         self.word_size = word_size  # Byte
@@ -22,6 +28,12 @@ class VectorUnit:
         )
         self.data_type = data_type
 
+        self.supports_vfexp2 = bool(supports_vfexp2)
+        self.vfexp2_elements_per_cycle = int(vfexp2_elements_per_cycle)
+        self.vfexp2_latency_cycles = int(vfexp2_latency_cycles)
+        self.vector_register_count = int(vector_register_count)
+        self.max_lmul = int(max_lmul)
+        self.online_softmax_calibration_profile = online_softmax_calibration_profile
 
 vector_unit_dict = {
     "A100_fp16": VectorUnit(512, 2, 35, 32, 4),
