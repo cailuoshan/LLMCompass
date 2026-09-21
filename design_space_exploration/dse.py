@@ -41,6 +41,7 @@ def template_to_system(arch_specs):
         35,
         vector_unit_specs["vector_width"],
         sublane_count,
+        data_type=data_type_dict[vector_unit_specs["data_type"]],
     )
     # systolic array
     systolic_array_specs = core_specs["systolic_array"]

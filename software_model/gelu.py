@@ -29,9 +29,7 @@ class GeLU(Operator):
         return input
 
     def roofline_model(self, pcb_module: Device):
-        self.computational_graph.data_type = (
-            pcb_module.compute_module.core.vector_unit.data_type
-        )
+        self.computational_graph.data_type = self.data_type
         M = self.M
         data_type = self.computational_graph.data_type
         total_io_count = M * 2 * data_type.word_size
@@ -61,9 +59,7 @@ class GeLU(Operator):
             self.data_type = data_type
 
     def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
-        self.computational_graph.data_type = (
-            pcb_module.compute_module.core.vector_unit.data_type
-        )
+        self.computational_graph.data_type = self.data_type
         parallelism = (
             pcb_module.compute_module.core_count
             * pcb_module.compute_module.core.vector_unit.vector_width

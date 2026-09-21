@@ -44,7 +44,14 @@
                     "register_bitwidth": 32,
                     "num_rdwr_ports": 4
                 },
-                "SRAM_KB": 128
+                "SRAM_KB": 128,
+                "precision_modes": {
+                    "bf16": {
+                        "matrix_mac_per_cycle": 1,
+                        "vector_flop_per_cycle": 4,
+                        "accumulation_dtype": "fp32"
+                    }
+                }
             }
         },
         "memory_protocol": "HBM2e",

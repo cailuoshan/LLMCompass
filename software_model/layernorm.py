@@ -9,7 +9,7 @@ import time
 import statistics
 import numpy as np
 import torch
-from software_model.search_protocol import MappingCandidate, ProviderProtocolError, execute_provider_search
+from software_model.search_protocol import execute_provider_search, MappingCandidate, ProviderProtocolError, validate_ranked_ids
 
 
 @torch.compile
@@ -78,9 +78,7 @@ class LayerNorm(Operator):
         if compile_mode == "transfer-learn":
             return self._compile_and_simulate_transfer_learn(pcb_module, provider=provider, stage=stage, hardware=hardware, trial_sink=trial_sink, operator_name=operator_name)
         self._active_trial_sink = trial_sink
-        self.computational_graph.data_type = (
-            pcb_module.compute_module.core.vector_unit.data_type
-        )
+        self.computational_graph.data_type = self.data_type
         min_cycle_count = float("inf")
         best_mapping = None
         M = self.computational_graph.M
@@ -130,7 +128,7 @@ class LayerNorm(Operator):
                 operator_name=self.recording_name,
                 operator_type="LayerNorm",
                 execution_kind="tiled_mapping",
-                graph={"M": M, "N": N},
+                graph={"M": M, "N": N, "dtype": self.data_type.name},
                 mapping=mapping,
                 cycle_count=cycle_count,
                 raw_local_latency_s=cycle_count
@@ -140,7 +138,7 @@ class LayerNorm(Operator):
             min_cycle_count = cycle_count
             best_mapping = mapping
         if trial_sink is not None:
-            candidate = MappingCandidate(operator_name=self.recording_name or "LayerNorm", operator_type="LayerNorm", execution_kind="tiled_mapping", strategy=None, graph={"M": M, "N": N}, mapping=dict(vars(mapping)), mapping_object=mapping)
+            candidate = MappingCandidate(operator_name=self.recording_name or "LayerNorm", operator_type="LayerNorm", execution_kind="tiled_mapping", strategy=None, graph={"M": M, "N": N, "dtype": self.data_type.name}, mapping=dict(vars(mapping)), mapping_object=mapping)
             trial_sink(candidate.to_dict(), float(cycle_count / pcb_module.compute_module.clock_freq), cycle_count, get_trial_latency_modifiers().get("strategy"))
         self.best_mapping = best_mapping
         self.best_cycle_count = min_cycle_count
@@ -155,7 +153,7 @@ class LayerNorm(Operator):
             raise NotImplementedError("Exhaustive search is not implemented for LayerNorm")
         if generation_mode not in ("heuristic-GPU", "heuristic-our-throughput", "heuristic-TPU"):
             raise ValueError("unsupported LayerNorm transfer candidate generation mode")
-        data_type = pcb_module.compute_module.core.vector_unit.data_type
+        data_type = self.data_type
         M, N = self.computational_graph.M, self.computational_graph.N
         l2_tile_N = N
         l2_tile_M = min(pcb_module.compute_module.l2_size // (l2_tile_N * data_type.word_size) // 2, M)
@@ -168,7 +166,7 @@ class LayerNorm(Operator):
             l1_tile_M = pcb_module.compute_module.core.SRAM_size // (2 * l1_tile_N * data_type.word_size)
         l1_tile_M = min(l1_tile_M, l2_tile_M)
         mapping = self.Mapping(l2_tile_M, l2_tile_N, l1_tile_M, l1_tile_N)
-        return [MappingCandidate(operator_name=self.recording_name or "LayerNorm", operator_type="LayerNorm", execution_kind="tiled_mapping", strategy=None, graph={"M": M, "N": N}, mapping=dict(vars(mapping)), mapping_object=mapping)]
+        return [MappingCandidate(operator_name=self.recording_name or "LayerNorm", operator_type="LayerNorm", execution_kind="tiled_mapping", strategy=None, graph={"M": M, "N": N, "dtype": self.data_type.name}, mapping=dict(vars(mapping)), mapping_object=mapping)]
 
     def evaluate_transfer_candidate(self, pcb_module, candidate, trial_sink=None):
         candidate = candidate if isinstance(candidate, MappingCandidate) else MappingCandidate(**candidate)
@@ -176,7 +174,7 @@ class LayerNorm(Operator):
         latency = cycle_count / pcb_module.compute_module.clock_freq
         recorder = get_active_recorder()
         if recorder is not None and self.recording_name is not None:
-            recorder.record_operator_mapping_trial(operator_name=self.recording_name, operator_type="LayerNorm", execution_kind="tiled_mapping", graph={"M": self.M, "N": self.N}, mapping=candidate.mapping_object, cycle_count=cycle_count, raw_local_latency_s=latency)
+            recorder.record_operator_mapping_trial(operator_name=self.recording_name, operator_type="LayerNorm", execution_kind="tiled_mapping", graph={"M": self.M, "N": self.N, "dtype": self.data_type.name}, mapping=candidate.mapping_object, cycle_count=cycle_count, raw_local_latency_s=latency)
         if trial_sink is not None:
             trial_sink(candidate.to_dict(), latency, cycle_count, None)
         self.best_mapping, self.best_cycle_count, self.best_latency = candidate.mapping_object, cycle_count, latency
@@ -186,38 +184,14 @@ class LayerNorm(Operator):
     def _compile_and_simulate_transfer_learn(self, pcb_module, provider=None, stage=None, hardware=None, trial_sink=None, operator_name=None):
         if provider is None:
             raise ProviderProtocolError("transfer-learn requires a provider")
-        candidates = self.enumerate_transfer_candidates(pcb_module, getattr(provider, "generation_mode", "heuristic-GPU"))
-        records = [candidate.to_dict() for candidate in candidates]
-        top_k = getattr(provider, "top_k", 1)
-        search_operator_name = operator_name or self.recording_name or "LayerNorm"
-        by_id = {candidate.candidate_id: candidate for candidate in candidates}
-        evaluations = {}
-
-        def evaluate_candidate(candidate_id):
-            try:
-                latency = self.evaluate_transfer_candidate(pcb_module, by_id[candidate_id], trial_sink)
-            except Exception as exc:
-                raise RuntimeError("transfer candidate evaluation failed: stage={}, operator={}, candidate_id={}".format(stage, operator_name or self.recording_name, candidate_id)) from exc
-            evaluations[candidate_id] = latency
-            return latency
-
-        evaluated_ids = execute_provider_search(
-            provider,
-            search_operator_name,
-            stage,
-            hardware or {},
-            {},
-            records,
-            top_k,
-            evaluate_candidate,
-        )
-        best_id = min(
-            evaluated_ids,
-            key=lambda candidate_id: (evaluations[candidate_id], candidate_id),
-        )
-        self.best_latency = evaluations[best_id]
-        self.best_mapping = by_id[best_id].mapping_object
-        self.latency = self.best_latency
+        candidates = self.enumerate_transfer_candidates(pcb_module,getattr(provider,"generation_mode","heuristic-GPU"))
+        by_id = {c.candidate_id:c for c in candidates}
+        measured = execute_provider_search(provider,operator_name or self.recording_name or "LayerNorm",stage,hardware,
+                     [c.to_dict() for c in candidates],lambda cid:self.evaluate_transfer_candidate(pcb_module,by_id[cid],trial_sink=trial_sink))
+        cid = min(measured,key=lambda cid:(measured[cid],cid))
+        self.best_mapping = by_id[cid].mapping_object
+        self.execution_kind = by_id[cid].execution_kind
+        self.latency = self.best_latency = measured[cid]
         return self.latency
 
     def simulate(
