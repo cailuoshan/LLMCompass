@@ -59,6 +59,9 @@ per_core_comm_dict = {'nvidia':per_core_comm_transistor_count, \
 pcie5_phy_mm2_per_lane = 0.64
 pcie4_phy_mm2_per_lane = 0.48
 ddr5_phy_mm2_per_link_unit = 1.45
+# Use DDR5 as the area baseline for adjacent DDR generations.
+ddr4_phy_mm2_per_link_unit = ddr5_phy_mm2_per_link_unit * 0.8
+ddr6_phy_mm2_per_link_unit = ddr5_phy_mm2_per_link_unit * 1.3
 hbm2e_phy_mm2_per_link_unit = 10.45
 nvlink3_phy_mm2_per_link_unit = 1.888
 nvlink4_phy_mm2_per_link_unit = 0.965
@@ -67,6 +70,8 @@ infinity_fabric_phy_mm2_per_link_unit = 5.69
 pcie5_ctrl_transistors_per_lane = 5372100
 pcie4_ctrl_transistors_per_lane = 3962500
 ddr5_ctrl_transistors_per_link_unit = 90446400
+ddr4_ctrl_transistors_per_link_unit = ddr5_ctrl_transistors_per_link_unit * 0.8
+ddr6_ctrl_transistors_per_link_unit = ddr5_ctrl_transistors_per_link_unit * 1.3
 hbm2e_ctrl_transistors_per_link_unit = 552743000
 nvlink3_ctrl_transistors_per_link_unit = 74632000
 nvlink4_ctrl_transistors_per_link_unit = 86628000
@@ -76,6 +81,8 @@ infinity_fabric_ctrl_transistors_per_link_unit = 348148000
 PCIE5 = 'PCIe5'
 PCIE4 = 'PCIe4'
 DDR5 = 'DDR5'
+DDR4 = 'DDR4'
+DDR6 = 'DDR6'
 HBM = 'HBM2e'
 NVLINK3 = 'NVLink3'
 NVLINK4 = 'NVLink4'
@@ -154,8 +161,12 @@ def calc_mem_controller_area_mm2(mem_tech, width, transistor_density_mil_mm2):
         controller_transistor_count = pcie5_ctrl_transistors_per_lane * width
     elif mem_tech == PCIE4:
         controller_transistor_count = pcie4_ctrl_transistors_per_lane * width
+    elif mem_tech == DDR4:
+        controller_transistor_count = ddr4_ctrl_transistors_per_link_unit * width
     elif mem_tech == DDR5:
         controller_transistor_count = ddr5_ctrl_transistors_per_link_unit * width
+    elif mem_tech == DDR6:
+        controller_transistor_count = ddr6_ctrl_transistors_per_link_unit * width
     elif mem_tech == HBM:
         controller_transistor_count = hbm2e_ctrl_transistors_per_link_unit * width
     elif mem_tech == NVLINK3:
@@ -172,8 +183,12 @@ def calc_mem_phy_area_mm2(mem_tech, width):
         return pcie5_phy_mm2_per_lane * width
     elif mem_tech == PCIE4:
         return pcie4_phy_mm2_per_lane * width
+    elif mem_tech == DDR4:
+        return ddr4_phy_mm2_per_link_unit * width
     elif mem_tech == DDR5:
         return ddr5_phy_mm2_per_link_unit * width
+    elif mem_tech == DDR6:
+        return ddr6_phy_mm2_per_link_unit * width
     elif mem_tech == HBM:
         return hbm2e_phy_mm2_per_link_unit * width
     elif mem_tech == NVLINK3:

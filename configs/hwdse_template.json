@@ -59,6 +59,7 @@
             "HBM2e",
             "DDR4",
             "DDR5",
+            "DDR6",
             "PCIe4",
             "PCIe5"
         ],
