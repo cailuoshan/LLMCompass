@@ -226,32 +226,52 @@ class TransformerModel:
         self.model_spec, self.workload_spec = model_spec, workload_spec
         self.stage, self.device_count = stage, device_count
         self.software_config = software_config or {"qkv_projection":"separate", "gate_up_projection":"separate"}
-        self.blocks = []
+        # Keep one graph per unique layer specification.  ``layer_count`` is
+        # applied to latency and persistent memory after that graph has been
+        # evaluated once, so homogeneous models never repeat mapping searches.
+        self.block_groups = []
         unique = {}
         for spec in model_spec.layers:
             key = fingerprint(spec.to_dict())
             if key not in unique:
-                unique[key] = TransformerBlock(spec, workload_spec, stage, device_count, self.software_config)
-            self.blocks.append(unique[key])
+                group = {
+                    "block": TransformerBlock(
+                        spec, workload_spec, stage, device_count, self.software_config
+                    ),
+                    "layer_count": 0,
+                }
+                unique[key] = group
+                self.block_groups.append(group)
+            unique[key]["layer_count"] += 1
+        # Compatibility for callers that inspect the constructed unique blocks.
+        self.blocks = tuple(group["block"] for group in self.block_groups)
 
     def memory_summary(self):
-        memories = [b.memory_summary() for b in self.blocks]
-        result = {key:sum(m[key] for m in memories) for key in ("resident_weight_bytes","kv_cache_bytes")}
-        result.update({key:max(m[key] for m in memories) for key in ("peak_live_activation_and_workspace_bytes","communication_buffers_bytes")})
+        memories = [
+            (group["block"].memory_summary(), group["layer_count"])
+            for group in self.block_groups
+        ]
+        result = {
+            key: sum(memory[key] * count for memory, count in memories)
+            for key in ("resident_weight_bytes", "kv_cache_bytes")
+        }
+        result.update({
+            key: max(memory[key] for memory, _ in memories)
+            for key in (
+                "peak_live_activation_and_workspace_bytes",
+                "communication_buffers_bytes",
+            )
+        })
         result["peak_bytes"] = sum(result.values())
         return result
 
     def compile_and_simulate(self, system, compile_mode, provider=None, stage=None, hardware=None, trial_sink=None, evaluation_cache=None):
         cache = evaluation_cache if evaluation_cache is not None else {}
         total_latency = 0.0
-        local = {}
-        hardware_spec = _hardware_signature(system)
-        for block in self.blocks:
-            signature = fingerprint({"layer":block.layer_spec.to_dict(), "workload":self.workload_spec.to_dict(), "stage":self.stage,
-                                     "hardware":hardware or {}, "system":hardware_spec, "device_count":self.device_count, "policy":block.policy, "compile_mode":compile_mode, "version":EVALUATOR_VERSION})
-            if signature not in local:
-                local[signature] = block.compile_and_simulate(system,compile_mode,provider,self.stage,hardware,trial_sink,cache)
-            total_latency += local[signature]["latency_s"]
+        for group in self.block_groups:
+            block = group["block"]
+            result = block.compile_and_simulate(system,compile_mode,provider,self.stage,hardware,trial_sink,cache)
+            total_latency += result["latency_s"] * group["layer_count"]
         return StageResult(total_latency, self.software_config)
 
 

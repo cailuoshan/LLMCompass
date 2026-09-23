@@ -66,6 +66,25 @@ class ModelSpec:
                 "tie_word_embeddings": self.tie_word_embeddings,
                 "max_position_embeddings": self.max_position_embeddings}
 
+    def to_compact_dict(self):
+        """Return an order-preserving run-length encoding of the layer stack."""
+        layer_runs = []
+        for layer in self.layers:
+            value = layer.to_dict()
+            if layer_runs and layer_runs[-1]["layer"] == value:
+                layer_runs[-1]["count"] += 1
+            else:
+                layer_runs.append({"count": 1, "layer": value})
+        return {
+            "name": self.name,
+            "hidden_size": self.hidden_size,
+            "num_layers": self.num_layers,
+            "layer_runs": layer_runs,
+            "vocab_size": self.vocab_size,
+            "tie_word_embeddings": self.tie_word_embeddings,
+            "max_position_embeddings": self.max_position_embeddings,
+        }
+
 
 @dataclass(frozen=True)
 class WorkloadSpec:
@@ -154,7 +173,11 @@ def parse_workload(config):
 
 
 def normalized_workload(model, workload):
-    return {"schema_version": 1, "model": model.to_dict(), "workload": workload.to_dict()}
+    # The parsed ModelSpec remains fully expanded for validation and heterogeneous
+    # graph construction.  Persistent identities only need an order-preserving
+    # compact representation; a homogeneous 96-layer model is therefore stored
+    # as one layer description with count=96 instead of 96 identical dictionaries.
+    return {"schema_version": 1, "model": model.to_compact_dict(), "workload": workload.to_dict()}
 
 
 def legacy_task_config(task):
